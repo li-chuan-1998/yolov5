@@ -4,7 +4,7 @@ Train a YOLOv5 model on a custom dataset.
 Models and datasets download automatically from the latest YOLOv5 release.
 
 Usage - Single-GPU training:
-    $ python train_fgsm.py --data coco128.yaml --weights yolov5s.pt --img 640  # from pretrained (recommended)
+    $ python train_fgsm.py --data coco128.yaml  # from pretrained (recommended)
     $ python train_fgsm.py --data car.yaml --weights yolov5s.pt --img 640
 
 Usage - Multi-GPU DDP training:
@@ -59,6 +59,9 @@ from utils.metrics import fitness
 from utils.plots import plot_evolve
 from utils.torch_utils import (EarlyStopping, ModelEMA, de_parallel, select_device, smart_DDP, smart_optimizer,
                                smart_resume, torch_distributed_zero_first)
+
+from torchvision.utils import save_image
+import torchvision.transforms as T
 
 LOCAL_RANK = int(os.getenv('LOCAL_RANK', -1))  # https://pytorch.org/docs/stable/elastic/run.html
 RANK = int(os.getenv('RANK', -1))
@@ -305,6 +308,8 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                     if 'momentum' in x:
                         x['momentum'] = np.interp(ni, xi, [hyp['warmup_momentum'], hyp['momentum']])
 
+            T.ToPILImage()(imgs[0]).show()
+
             # Multi-scale
             if opt.multi_scale:
                 sz = random.randrange(imgsz * 0.5, imgsz * 1.5 + gs) // gs * gs  # size
@@ -315,6 +320,7 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
 
             # Forward
             with torch.cuda.amp.autocast(amp):
+                # save_image(imgs[0], os.path.join("../datasets/adv/train/", paths[0].split("\\")[-1]))
                 pred = model(imgs)  # forward
                 loss, loss_items = compute_loss(pred, targets.to(device))  # loss scaled by batch_size
                 if RANK != -1:
@@ -324,7 +330,6 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
 
 
             # Backward
-            print(loss_items, loss)
             scaler.scale(loss).backward()
 
             # Optimize - https://pytorch.org/docs/master/notes/amp_examples.html
@@ -338,8 +343,16 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                     ema.update(model)
                 last_opt_step = ni
 
+            # Attack In Progress
             data_grad = imgs.grad.data
-            perturbed_data = fgsm_attack(imgs, 0.05, data_grad)
+            folder_img = "../datasets/adv/train/"
+            folder_grad = "../datasets/adv/train_grad/"
+            img_name = paths[0].split("\\")[-1]
+            # save_image(imgs[0], os.path.join(folder_img, img_name))
+            # torch.save(data_grad[0], os.path.join(folder_grad, img_name.replace(".jpg",".pt")))
+
+            return 
+            # perturbed_data = fgsm_attack(imgs, 0.05, data_grad)
 
 
             # Log
