@@ -6,6 +6,7 @@ Models and datasets download automatically from the latest YOLOv5 release.
 Usage - Single-GPU training:
     $ python train_fgsm.py --data coco128.yaml  # from pretrained (recommended)
     $ python train_fgsm.py --data car.yaml --weights yolov5s.pt --img 640
+    $ python.exe -O train_fgsm.py --data coco.yaml --batch-size 1 --weights yolov5s.pt --img 640
 
 Usage - Multi-GPU DDP training:
     $ python -m torch.distributed.run --nproc_per_node 4 --master_port 1 train.py --data coco128.yaml --weights yolov5s.pt --img 640 --device 0,1,2,3
@@ -68,7 +69,9 @@ RANK = int(os.getenv('RANK', -1))
 WORLD_SIZE = int(os.getenv('WORLD_SIZE', 1))
 GIT_INFO = check_git_info()
 
-def fgsm_attack(image, epsilon, data_grad):
+def gausian_noise(image):
+
+def fgsm_att(data_grad, image, epsilon=.05):
     # Collect the element-wise sign of the data gradient
     sign_data_grad = data_grad.sign()
     # Create the perturbed image by adjusting each pixel of the input image
@@ -77,6 +80,25 @@ def fgsm_attack(image, epsilon, data_grad):
     perturbed_image = torch.clamp(perturbed_image, 0, 1)
     # Return the perturbed image
     return perturbed_image
+
+def fgsm_att_imp(data_grad, x_query, n_iter=10, eps=8/255., eps_iter=2/255.):
+    eta = torch.FloatTensor(x_query.shape).uniform_(-eps, eps).cuda()
+    x_adv = torch.clamp(x_query + eta, 0.0, 1.0).cuda()
+    for _ in range(n_iter):
+        x_adv -= eps_iter * data_grad.sign()
+        eta = torch.clamp(x_adv - x_query, -eps, eps)
+        x_adv = torch.clamp(x_query + eta, 0.0, 1.0)
+    return x_adv
+
+def single_channel_att(data_grad, image, epsilon=.05):
+    sign_data_grad = data_grad.sign()
+    r = torch.cat([(image[0] + epsilon*sign_data_grad[0]).unsqueeze(0), image[1].unsqueeze(0), image[2].unsqueeze(0)])
+    r = torch.clamp(r, 0, 1)
+    g = torch.cat([image[0].unsqueeze(0), (image[1] + epsilon*sign_data_grad[1]).unsqueeze(0), image[2].unsqueeze(0)])
+    g = torch.clamp(g, 0, 1)
+    b = torch.cat([image[0].unsqueeze(0), image[1].unsqueeze(0), (image[2] + epsilon*sign_data_grad[2]).unsqueeze(0)])
+    b = torch.clamp(b, 0, 1)
+    return r,g,b
 
 def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictionary
     save_dir, epochs, batch_size, weights, single_cls, evolve, data, cfg, resume, noval, nosave, workers, freeze = \
@@ -202,7 +224,7 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                                               gs,
                                               single_cls,
                                               hyp=hyp,
-                                              augment=True,
+                                              augment=False,
                                               cache=None if opt.cache == 'val' else opt.cache,
                                               rect=opt.rect,
                                               rank=LOCAL_RANK,
@@ -270,6 +292,13 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                 f'Using {train_loader.num_workers * WORLD_SIZE} dataloader workers\n'
                 f"Logging results to {colorstr('bold', save_dir)}\n"
                 f'Starting training for {epochs} epochs...')
+    
+    # Freeze all layers
+    for k, v in model.named_parameters():
+        v.requires_grad = False
+    for para in model.parameters():
+        para.requires_grad = False
+
     for epoch in range(start_epoch, epochs):  # epoch ------------------------------------------------------------------
         callbacks.run('on_train_epoch_start')
         model.train()
@@ -308,7 +337,6 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                     if 'momentum' in x:
                         x['momentum'] = np.interp(ni, xi, [hyp['warmup_momentum'], hyp['momentum']])
 
-            T.ToPILImage()(imgs[0]).show()
 
             # Multi-scale
             if opt.multi_scale:
@@ -320,7 +348,7 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
 
             # Forward
             with torch.cuda.amp.autocast(amp):
-                # save_image(imgs[0], os.path.join("../datasets/adv/train/", paths[0].split("\\")[-1]))
+                # T.ToPILImage()(imgs[0]).show()
                 pred = model(imgs)  # forward
                 loss, loss_items = compute_loss(pred, targets.to(device))  # loss scaled by batch_size
                 if RANK != -1:
@@ -330,8 +358,12 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
 
 
             # Backward
-            scaler.scale(loss).backward()
-
+            # scaler.scale(loss).backward()
+            try:
+                scaler.scale(loss).backward()
+            except:
+                pass
+            
             # Optimize - https://pytorch.org/docs/master/notes/amp_examples.html
             if ni - last_opt_step >= accumulate:
                 scaler.unscale_(optimizer)  # unscale gradients
@@ -344,16 +376,17 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                 last_opt_step = ni
 
             # Attack In Progress
-            data_grad = imgs.grad.data
-            folder_img = "../datasets/adv/train/"
-            folder_grad = "../datasets/adv/train_grad/"
             img_name = paths[0].split("\\")[-1]
-            # save_image(imgs[0], os.path.join(folder_img, img_name))
-            # torch.save(data_grad[0], os.path.join(folder_grad, img_name.replace(".jpg",".pt")))
-
-            return 
-            # perturbed_data = fgsm_attack(imgs, 0.05, data_grad)
-
+            adv_img_fgsm = fgsm_att(imgs.grad.data[0], imgs[0])
+            adv_img_fgsm_imp = fgsm_att_imp(imgs.grad.data[0], imgs[0])
+            adv_single_channel_att_r, adv_single_channel_att_g, adv_single_channel_att_b = single_channel_att(imgs.grad.data[0], imgs[0])
+            save_image(adv_img_fgsm, os.path.join("../datasets/adv/train_fgsm/", img_name))
+            save_image(adv_img_fgsm_imp, os.path.join("../datasets/adv/train_fgsm_imp/", img_name))
+            # save_image(adv_single_channel_att_r, os.path.join("../datasets/adv/train_sc_r/", img_name))
+            save_image(adv_single_channel_att_g, os.path.join("../datasets/adv/train_sc_g/", img_name))
+            save_image(adv_single_channel_att_b, os.path.join("../datasets/adv/train_sc_b/", img_name))
+            
+            # torch.save(imgs.grad.data[0], os.path.join(folder_grad, img_name.replace(".jpg",".pt")))
 
             # Log
             if RANK in {-1, 0}:
@@ -365,7 +398,7 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                 if callbacks.stop_training:
                     return
             # end batch ------------------------------------------------------------------------------------------------
-
+        return 
         # Scheduler
         lr = [x['lr'] for x in optimizer.param_groups]  # for loggers
         scheduler.step()
@@ -465,7 +498,7 @@ def parse_opt(known=False):
     parser.add_argument('--cfg', type=str, default='', help='model.yaml path')
     parser.add_argument('--data', type=str, default=ROOT / 'data/car.yaml', help='dataset.yaml path')
     parser.add_argument('--hyp', type=str, default=ROOT / 'data/hyps/hyp.scratch-low.yaml', help='hyperparameters path')
-    parser.add_argument('--epochs', type=int, default=100, help='total training epochs')
+    parser.add_argument('--epochs', type=int, default=1, help='total training epochs')
     parser.add_argument('--batch-size', type=int, default=1, help='total batch size for all GPUs, -1 for autobatch')
     parser.add_argument('--imgsz', '--img', '--img-size', type=int, default=640, help='train, val image size (pixels)')
     parser.add_argument('--rect', action='store_true', help='rectangular training')
